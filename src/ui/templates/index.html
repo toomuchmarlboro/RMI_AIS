@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RMI AIS — Vessel Tracking & Recording Intelligence</title>
+  <!-- Tailwind CSS & FontAwesome -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <!-- Leaflet Map CSS & JS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    #map { height: 480px; width: 100%; border-radius: 0.5rem; z-index: 10; }
+    .pulse-dot {
+      animation: pulse 1.5s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.4; transform: scale(1.15); }
+    }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col font-sans">
+
+  <!-- Header Navigation -->
+  <header class="bg-slate-900 border-b border-slate-800 px-6 py-4 flex flex-wrap items-center justify-between shadow-lg sticky top-0 z-50">
+    <div class="flex items-center space-x-3">
+      <div class="bg-blue-600 p-2.5 rounded-lg text-white shadow-md">
+        <i class="fa-solid fa-ship text-xl"></i>
+      </div>
+      <div>
+        <h1 class="text-xl font-bold tracking-tight text-white flex items-center gap-2">
+          RMI AIS <span class="text-xs uppercase bg-blue-500/20 text-blue-400 border border-blue-500/30 px-2 py-0.5 rounded font-semibold">Marine Intelligence</span>
+        </h1>
+        <p class="text-xs text-slate-400">High-Fidelity AIS Data Recorder & Observation System</p>
+      </div>
+    </div>
+
+    <!-- Active Source & Recording Status -->
+    <div class="flex items-center space-x-4 mt-2 sm:mt-0">
+      <div class="flex items-center bg-slate-800/80 border border-slate-700/60 rounded-lg px-3 py-1.5 text-xs">
+        <span class="text-slate-400 mr-2">Feed Source:</span>
+        <span id="source-badge" class="font-semibold text-emerald-400 uppercase tracking-wide">SIMULATOR</span>
+      </div>
+
+      <div id="recording-status-box" class="flex items-center bg-slate-800/80 border border-slate-700/60 rounded-lg px-3 py-1.5 text-xs">
+        <span id="recording-dot" class="w-2.5 h-2.5 rounded-full bg-slate-500 mr-2"></span>
+        <span id="recording-label" class="font-semibold text-slate-300">IDLE</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Container -->
+  <main class="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 space-y-6">
+
+    <!-- Top Action Bar: Recording Controls -->
+    <section class="bg-slate-900/90 border border-slate-800 rounded-xl p-5 shadow-sm backdrop-blur">
+      <div class="flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+        
+        <div class="space-y-1">
+          <div class="flex items-center gap-2">
+            <h2 class="text-base font-semibold text-white">Observation Session Control</h2>
+            <span class="text-xs text-slate-400">(Captures all dynamic & static vessel reports with dual timestamps)</span>
+          </div>
+          <div class="text-xs text-slate-400 flex flex-wrap items-center gap-4">
+            <span>Station: <strong id="lbl-station" class="text-slate-200">Station-Desktop-01</strong></span>
+            <span>Session ID: <strong id="lbl-session-id" class="text-slate-200">None</strong></span>
+            <span>Recorded Messages: <strong id="lbl-msg-count" class="text-blue-400">0</strong></span>
+          </div>
+        </div>
+
+        <!-- Controls -->
+        <div class="flex items-center gap-3 w-full md:w-auto">
+          <div class="flex-1 md:w-48">
+            <input type="text" id="input-station" placeholder="Observer Station ID" value="Station-Desktop-01"
+              class="w-full bg-slate-950 border border-slate-700 text-xs px-3 py-2 rounded-lg focus:outline-none focus:border-blue-500 text-slate-200">
+          </div>
+
+          <button id="btn-start-record" onclick="startRecording()"
+            class="bg-rose-600 hover:bg-rose-500 text-white font-medium text-xs px-4 py-2 rounded-lg flex items-center gap-2 shadow transition">
+            <i class="fa-solid fa-circle text-[10px]"></i> Start Recording
+          </button>
+
+          <button id="btn-stop-record" onclick="stopRecording()" disabled
+            class="bg-slate-800 text-slate-500 font-medium text-xs px-4 py-2 rounded-lg flex items-center gap-2 transition cursor-not-allowed">
+            <i class="fa-solid fa-stop"></i> Stop & Save
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Map & Fleet Split -->
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+      
+      <!-- Interactive Nautical Map -->
+      <div class="lg:col-span-2 bg-slate-900/90 border border-slate-800 rounded-xl p-4 shadow-sm flex flex-col">
+        <div class="flex items-center justify-between mb-3">
+          <div class="flex items-center gap-2">
+            <i class="fa-solid fa-map-location-dot text-blue-400"></i>
+            <h3 class="text-sm font-semibold text-white">Live AIS Tracking Map</h3>
+          </div>
+          <span class="text-xs text-slate-400">Updates live from AIS messages</span>
+        </div>
+        <div id="map" class="flex-1"></div>
+      </div>
+
+      <!-- Quick Vessel Inspector Card (VesselFinder Style) -->
+      <div class="bg-slate-900/90 border border-slate-800 rounded-xl p-5 shadow-sm flex flex-col justify-between">
+        <div>
+          <div class="flex items-center justify-between border-b border-slate-800 pb-3 mb-4">
+            <div class="flex items-center gap-2">
+              <i class="fa-solid fa-compass text-blue-400"></i>
+              <h3 class="text-sm font-semibold text-white">Selected Vessel Card</h3>
+            </div>
+            <span class="text-[11px] bg-slate-800 text-blue-300 px-2 py-0.5 rounded" id="inspect-mmsi">MMSI: --</span>
+          </div>
+
+          <div id="inspector-content" class="space-y-3 text-xs">
+            <!-- Vessel Header -->
+            <div>
+              <h4 id="inspect-name" class="text-base font-bold text-white">Select a ship on map or table</h4>
+              <p id="inspect-type" class="text-slate-400 italic">No vessel selected</p>
+            </div>
+
+            <!-- Dynamic Telemetry Grid -->
+            <div class="grid grid-cols-2 gap-2 bg-slate-950/70 p-3 rounded-lg border border-slate-800/80">
+              <div>
+                <span class="text-slate-500 block text-[10px] uppercase font-semibold">Speed (SOG)</span>
+                <span id="inspect-sog" class="text-sm font-bold text-emerald-400">-- kn</span>
+              </div>
+              <div>
+                <span class="text-slate-500 block text-[10px] uppercase font-semibold">Course (COG)</span>
+                <span id="inspect-cog" class="text-sm font-bold text-slate-200">-- °</span>
+              </div>
+              <div>
+                <span class="text-slate-500 block text-[10px] uppercase font-semibold">True Heading</span>
+                <span id="inspect-hdg" class="text-sm font-bold text-slate-200">-- °</span>
+              </div>
+              <div>
+                <span class="text-slate-500 block text-[10px] uppercase font-semibold">Draught</span>
+                <span id="inspect-draught" class="text-sm font-bold text-sky-400">-- m</span>
+              </div>
+            </div>
+
+            <!-- Navigation Status -->
+            <div class="bg-slate-950/70 p-3 rounded-lg border border-slate-800/80">
+              <span class="text-slate-500 block text-[10px] uppercase font-semibold">Navigation Status</span>
+              <span id="inspect-status" class="text-xs font-semibold text-amber-300">--</span>
+            </div>
+
+            <!-- Particulars -->
+            <div class="bg-slate-950/70 p-3 rounded-lg border border-slate-800/80 space-y-1.5">
+              <span class="text-slate-500 block text-[10px] uppercase font-semibold">Vessel Particulars</span>
+              <div class="flex justify-between"><span class="text-slate-400">Gross Tonnage:</span> <strong id="inspect-gt" class="text-slate-200">-- GT</strong></div>
+              <div class="flex justify-between"><span class="text-slate-400">Dimensions:</span> <strong id="inspect-dim" class="text-slate-200">-- m</strong></div>
+              <div class="flex justify-between"><span class="text-slate-400">Deadweight (DWT):</span> <strong id="inspect-dwt" class="text-slate-200">-- tonnes</strong></div>
+              <div class="flex justify-between"><span class="text-slate-400">IMO / Call Sign:</span> <strong id="inspect-imo" class="text-slate-200">-- / --</strong></div>
+              <div class="flex justify-between"><span class="text-slate-400">Destination / ETA:</span> <strong id="inspect-dest" class="text-slate-200">--</strong></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="mt-4 pt-3 border-t border-slate-800 text-[11px] text-slate-400 flex items-center justify-between">
+          <span>Observation Window:</span>
+          <span id="inspect-window" class="text-slate-300 font-mono">--</span>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Vessels Fleet Table -->
+    <section class="bg-slate-900/90 border border-slate-800 rounded-xl p-5 shadow-sm">
+      <div class="flex items-center justify-between mb-4">
+        <div class="flex items-center gap-2">
+          <i class="fa-solid fa-list-check text-blue-400"></i>
+          <h3 class="text-sm font-semibold text-white">Tracked Vessels Fleet (VesselFinder View)</h3>
+        </div>
+        <span class="text-xs text-slate-400" id="fleet-count">0 vessels</span>
+      </div>
+
+      <div class="overflow-x-auto">
+        <table class="w-full text-left text-xs">
+          <thead class="bg-slate-950/80 text-slate-400 uppercase text-[10px] border-b border-slate-800 font-semibold tracking-wider">
+            <tr>
+              <th class="py-3 px-3">Ship Name</th>
+              <th class="py-3 px-3">Type / Class</th>
+              <th class="py-3 px-3">MMSI</th>
+              <th class="py-3 px-3">Speed (kn)</th>
+              <th class="py-3 px-3">Course / Hdg</th>
+              <th class="py-3 px-3">Draught (m)</th>
+              <th class="py-3 px-3">Status</th>
+              <th class="py-3 px-3">Size (LOA x Beam)</th>
+              <th class="py-3 px-3">Gross Tonnage</th>
+              <th class="py-3 px-3">Destination</th>
+              <th class="py-3 px-3 text-right">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="vessels-tbody" class="divide-y divide-slate-800/60 text-slate-300">
+            <tr>
+              <td colspan="11" class="text-center py-6 text-slate-500">Connecting to AIS feed...</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Sessions History & Export -->
+    <section class="bg-slate-900/90 border border-slate-800 rounded-xl p-5 shadow-sm">
+      <div class="flex items-center justify-between mb-4">
+        <div class="flex items-center gap-2">
+          <i class="fa-solid fa-file-export text-blue-400"></i>
+          <h3 class="text-sm font-semibold text-white">Recorded Sessions & Export</h3>
+        </div>
+        <span class="text-xs text-slate-400">Download formatted CSV / JSON matching spec</span>
+      </div>
+
+      <div class="overflow-x-auto">
+        <table class="w-full text-left text-xs">
+          <thead class="bg-slate-950/80 text-slate-400 uppercase text-[10px] border-b border-slate-800 font-semibold tracking-wider">
+            <tr>
+              <th class="py-3 px-3">Observation ID</th>
+              <th class="py-3 px-3">Station</th>
+              <th class="py-3 px-3">Start (UTC)</th>
+              <th class="py-3 px-3">Window</th>
+              <th class="py-3 px-3">Mode</th>
+              <th class="py-3 px-3">Messages</th>
+              <th class="py-3 px-3 text-right">Export</th>
+            </tr>
+          </thead>
+          <tbody id="sessions-tbody" class="divide-y divide-slate-800/60 text-slate-300">
+            <tr>
+              <td colspan="7" class="text-center py-4 text-slate-500">No recorded sessions yet. Click "Start Recording" above.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Live Telemetry Stream Log -->
+    <section class="bg-slate-900/90 border border-slate-800 rounded-xl p-5 shadow-sm">
+      <div class="flex items-center justify-between mb-3">
+        <div class="flex items-center gap-2">
+          <i class="fa-solid fa-terminal text-blue-400"></i>
+          <h3 class="text-sm font-semibold text-white">Raw NMEA & Telemetry Stream (High-Frequency Feed)</h3>
+        </div>
+        <span class="text-xs text-slate-400">Last 50 captured messages</span>
+      </div>
+      <div class="bg-slate-950 rounded-lg p-3 font-mono text-[11px] h-48 overflow-y-auto border border-slate-800/80 space-y-1" id="stream-log">
+        <div class="text-slate-500">// Waiting for AIS messages...</div>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="bg-slate-900 border-t border-slate-800 px-6 py-4 text-center text-xs text-slate-500">
+    Recordable Marine Intelligence (RMI AIS) &bull; Phase 1 Offline Simulator + aisstream.io &bull; Offline-First Architecture
+  </footer>
+
+  <!-- Dashboard JavaScript Logic -->
+  <script>
+    // Map initialization
+    let map = L.map('map').setView([-5.95, 106.0], 9);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 18,
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    let vesselMarkers = {};
+    let trackedVessels = [];
+    let selectedMmsi = null;
+
+    // Fetch live state from backend
+    async function updateDashboardState() {
+      try {
+        const res = await fetch('/api/state');
+        if (!res.ok) return;
+        const data = await res.json();
+
+        // Update Feed Source
+        document.getElementById('source-badge').innerText = data.source_mode.toUpperCase();
+
+        // Update Recording Box
+        const recDot = document.getElementById('recording-dot');
+        const recLbl = document.getElementById('recording-label');
+        const btnStart = document.getElementById('btn-start-record');
+        const btnStop = document.getElementById('btn-stop-record');
+
+        if (data.is_recording && data.active_session) {
+          recDot.className = "w-2.5 h-2.5 rounded-full bg-rose-500 pulse-dot mr-2";
+          recLbl.innerHTML = `<span class="text-rose-400">RECORDING: ${data.active_session.session_id}</span>`;
+          document.getElementById('lbl-session-id').innerText = data.active_session.session_id;
+          document.getElementById('lbl-station').innerText = data.active_session.station_id;
+          document.getElementById('lbl-msg-count').innerText = data.active_session.message_count;
+          
+          btnStart.disabled = true;
+          btnStart.className = "bg-slate-800 text-slate-600 font-medium text-xs px-4 py-2 rounded-lg cursor-not-allowed";
+          btnStop.disabled = false;
+          btnStop.className = "bg-rose-600 hover:bg-rose-500 text-white font-medium text-xs px-4 py-2 rounded-lg cursor-pointer";
+        } else {
+          recDot.className = "w-2.5 h-2.5 rounded-full bg-slate-500 mr-2";
+          recLbl.innerText = "IDLE";
+          document.getElementById('lbl-session-id').innerText = "None";
+          document.getElementById('lbl-msg-count').innerText = "0";
+
+          btnStart.disabled = false;
+          btnStart.className = "bg-rose-600 hover:bg-rose-500 text-white font-medium text-xs px-4 py-2 rounded-lg cursor-pointer";
+          btnStop.disabled = true;
+          btnStop.className = "bg-slate-800 text-slate-600 font-medium text-xs px-4 py-2 rounded-lg cursor-not-allowed";
+        }
+
+        // Update vessels
+        trackedVessels = data.vessels || [];
+        document.getElementById('fleet-count').innerText = `${trackedVessels.length} vessels`;
+        renderVessels(trackedVessels);
+        renderMapMarkers(trackedVessels);
+
+        // Update inspect card if vessel is selected or auto-select first
+        if (trackedVessels.length > 0) {
+          if (!selectedMmsi) {
+            selectVessel(trackedVessels[0].mmsi);
+          } else {
+            const current = trackedVessels.find(v => v.mmsi === selectedMmsi);
+            if (current) selectVessel(current.mmsi);
+          }
+        }
+
+        // Update sessions list
+        renderSessions(data.sessions || []);
+
+        // Update telemetry log
+        renderStream(data.recent_records || []);
+
+      } catch (err) {
+        console.error("Dashboard poll error:", err);
+      }
+    }
+
+    function renderMapMarkers(vessels) {
+      vessels.forEach(v => {
+        if (v.latitude == null || v.longitude == null) return;
+        const pos = [v.latitude, v.longitude];
+
+        if (vesselMarkers[v.mmsi]) {
+          vesselMarkers[v.mmsi].setLatLng(pos);
+        } else {
+          const marker = L.circleMarker(pos, {
+            radius: 7,
+            fillColor: "#3b82f6",
+            color: "#ffffff",
+            weight: 2,
+            opacity: 1,
+            fillOpacity: 0.9
+          }).addTo(map);
+
+          marker.bindTooltip(`<strong>${v.name}</strong><br>SOG: ${v.speed_knots} kn | COG: ${v.course_deg}°`, { direction: 'top' });
+          marker.on('click', () => selectVessel(v.mmsi));
+          vesselMarkers[v.mmsi] = marker;
+        }
+      });
+    }
+
+    function selectVessel(mmsi) {
+      selectedMmsi = mmsi;
+      const v = trackedVessels.find(x => x.mmsi === mmsi);
+      if (!v) return;
+
+      document.getElementById('inspect-mmsi').innerText = `MMSI: ${v.mmsi}`;
+      document.getElementById('inspect-name').innerText = v.name;
+      document.getElementById('inspect-type').innerText = v.ship_type || "Unspecified";
+
+      document.getElementById('inspect-sog').innerText = v.speed_knots != null ? `${v.speed_knots} kn` : "-- kn";
+      document.getElementById('inspect-cog').innerText = v.course_deg != null ? `${v.course_deg}°` : "-- °";
+      document.getElementById('inspect-hdg').innerText = v.heading_deg != null ? `${v.heading_deg}°` : "-- °";
+      document.getElementById('inspect-draught').innerText = v.draught_meters != null ? `${v.draught_meters} m` : "-- m";
+      document.getElementById('inspect-status').innerText = v.nav_status_label || "Undefined";
+
+      const p = v.particulars || {};
+      document.getElementById('inspect-gt').innerText = p.gross_tonnage ? `${p.gross_tonnage} GT` : "--";
+      document.getElementById('inspect-dim').innerText = (p.length_overall_m && p.beam_m) ? `${p.length_overall_m}m x ${p.beam_m}m` : "--";
+      document.getElementById('inspect-dwt').innerText = p.deadweight_tonnes ? `${p.deadweight_tonnes} tonnes` : "--";
+      document.getElementById('inspect-imo').innerText = `${v.imo_number || '--'} / ${v.call_sign || '--'}`;
+      document.getElementById('inspect-dest').innerText = `${v.destination || '--'} (ETA: ${v.eta || '--'})`;
+
+      if (v.last_position_utc) {
+        const d = new Date(v.last_position_utc);
+        document.getElementById('inspect-window').innerText = d.toTimeString().split(' ')[0] + " UTC";
+      }
+
+      // Pan map smoothly to selected vessel
+      if (v.latitude && v.longitude) {
+        map.panTo([v.latitude, v.longitude]);
+      }
+    }
+
+    function renderVessels(vessels) {
+      const tbody = document.getElementById('vessels-tbody');
+      if (!vessels.length) {
+        tbody.innerHTML = `<tr><td colspan="11" class="text-center py-6 text-slate-500">No vessels detected yet.</td></tr>`;
+        return;
+      }
+
+      tbody.innerHTML = vessels.map(v => {
+        const p = v.particulars || {};
+        const dimStr = (p.length_overall_m && p.beam_m) ? `${p.length_overall_m}m × ${p.beam_m}m` : "--";
+        const gtStr = p.gross_tonnage ? `${p.gross_tonnage} GT` : "--";
+        const isSelected = v.mmsi === selectedMmsi;
+
+        return `
+          <tr class="hover:bg-slate-800/40 transition cursor-pointer ${isSelected ? 'bg-blue-900/20 border-l-2 border-blue-500' : ''}" onclick="selectVessel(${v.mmsi})">
+            <td class="py-3 px-3 font-semibold text-white flex items-center gap-2">
+              <i class="fa-solid fa-ship text-blue-400 text-xs"></i> ${v.name}
+            </td>
+            <td class="py-3 px-3 text-slate-400">${v.ship_type || 'Unspecified'}</td>
+            <td class="py-3 px-3 font-mono text-slate-300">${v.mmsi}</td>
+            <td class="py-3 px-3 font-bold text-emerald-400">${v.speed_knots != null ? v.speed_knots : '--'}</td>
+            <td class="py-3 px-3 font-mono">${v.course_deg != null ? v.course_deg + '°' : '--'}</td>
+            <td class="py-3 px-3 text-sky-400">${v.draught_meters != null ? v.draught_meters : '--'}</td>
+            <td class="py-3 px-3">
+              <span class="bg-slate-800 text-amber-300 px-2 py-0.5 rounded text-[10px] font-medium">${v.nav_status_label || 'Undefined'}</span>
+            </td>
+            <td class="py-3 px-3 text-slate-300 font-mono">${dimStr}</td>
+            <td class="py-3 px-3 text-slate-300 font-mono">${gtStr}</td>
+            <td class="py-3 px-3 text-slate-400">${v.destination || '--'}</td>
+            <td class="py-3 px-3 text-right">
+              <button onclick="event.stopPropagation(); selectVessel(${v.mmsi});" class="text-blue-400 hover:text-blue-300 font-medium">Inspect</button>
+            </td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    function renderSessions(sessions) {
+      const tbody = document.getElementById('sessions-tbody');
+      if (!sessions.length) {
+        tbody.innerHTML = `<tr><td colspan="7" class="text-center py-4 text-slate-500">No recorded sessions yet.</td></tr>`;
+        return;
+      }
+
+      tbody.innerHTML = sessions.map(s => {
+        const start = new Date(s.start_time_utc).toISOString().replace('T', ' ').substring(0, 19);
+        return `
+          <tr class="hover:bg-slate-800/40 transition">
+            <td class="py-2.5 px-3 font-mono text-blue-400 font-semibold">${s.session_id}</td>
+            <td class="py-2.5 px-3 text-slate-400">${s.station_id}</td>
+            <td class="py-2.5 px-3 font-mono text-slate-300">${start}</td>
+            <td class="py-2.5 px-3 text-slate-400">${s.window_label || '--'}</td>
+            <td class="py-2.5 px-3 uppercase text-[10px]"><span class="bg-slate-800 text-slate-300 px-1.5 py-0.5 rounded">${s.recording_mode}</span></td>
+            <td class="py-2.5 px-3 font-bold text-slate-200">${s.message_count}</td>
+            <td class="py-2.5 px-3 text-right space-x-2">
+              <a href="/api/export/${s.session_id}?format=csv" class="bg-slate-800 hover:bg-slate-700 text-sky-400 px-2.5 py-1 rounded text-[11px] font-medium transition inline-flex items-center gap-1">
+                <i class="fa-solid fa-file-csv"></i> CSV
+              </a>
+              <a href="/api/export/${s.session_id}?format=json" class="bg-slate-800 hover:bg-slate-700 text-emerald-400 px-2.5 py-1 rounded text-[11px] font-medium transition inline-flex items-center gap-1">
+                <i class="fa-solid fa-file-code"></i> JSON
+              </a>
+            </td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    function renderStream(records) {
+      const logBox = document.getElementById('stream-log');
+      if (!records.length) return;
+
+      logBox.innerHTML = records.map(r => {
+        const t = r.received_at_utc ? new Date(r.received_at_utc).toISOString().split('T')[1].replace('Z','') : '';
+        return `
+          <div class="text-slate-400 flex items-start gap-2">
+            <span class="text-slate-600 font-mono">[${t}]</span>
+            <span class="text-blue-400 font-semibold">${r.ship_name || ('MMSI:' + r.mmsi)}:</span>
+            <span class="text-emerald-400">SOG:${r.speed_knots || 0}kn</span>
+            <span class="text-slate-300">COG:${r.course_deg || 0}°</span>
+            <span class="text-slate-500 truncate flex-1 font-mono">${r.raw_nmea || ''}</span>
+          </div>
+        `;
+      }).join('');
+    }
+
+    async function startRecording() {
+      const station = document.getElementById('input-station').value.trim() || 'Station-Desktop-01';
+      const res = await fetch('/api/record/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ station_id: station })
+      });
+      if (res.ok) {
+        updateDashboardState();
+      }
+    }
+
+    async function stopRecording() {
+      const res = await fetch('/api/record/stop', { method: 'POST' });
+      if (res.ok) {
+        updateDashboardState();
+      }
+    }
+
+    // Refresh every 1.5 seconds
+    setInterval(updateDashboardState, 1500);
+    updateDashboardState();
+  </script>
+</body>
+</html>

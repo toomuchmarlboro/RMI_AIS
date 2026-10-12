@@ -1,0 +1,81 @@
+app:
+  name: "RMI AIS Vessel Tracker"
+  version: "1.0.0"
+  default_station: "Station-Desktop-01"
+
+storage:
+  database_path: "data/rmi_ais.db"
+  export_dir: "data/exports"
+
+simulator:
+  update_interval_sec: 3.0
+  # Preset vessels modeled matching VesselFinder format (Merak / Sunda Strait region)
+  vessels:
+    - mmsi: 525019876
+      name: "Virgo 18"
+      ship_type: "Passenger/Ro-Ro Cargo Ship"
+      imo: 9123456
+      call_sign: "YCGR"
+      draught: 5.2
+      destination: "BAKAUHENI"
+      eta: "10-13 06:00"
+      gross_tonnage: 9989
+      deadweight: 3500
+      length: 134.0
+      beam: 22.0
+      year_built: 2015
+      flag: "Indonesia"
+      initial_lat: -5.9320
+      initial_lon: 105.9980
+      initial_sog: 13.9
+      initial_cog: 107.3
+      initial_hdg: 109
+      nav_status: 0 # Under way using engine
+
+    - mmsi: 525022134
+      name: "Batam Jet 2"
+      ship_type: "High Speed Craft"
+      imo: 8976543
+      call_sign: "POWZ"
+      draught: 2.1
+      destination: "SEKUPANG"
+      eta: "10-13 04:30"
+      gross_tonnage: 420
+      deadweight: 120
+      length: 38.0
+      beam: 7.5
+      year_built: 2018
+      flag: "Indonesia"
+      initial_lat: 1.1250
+      initial_lon: 103.9210
+      initial_sog: 28.4
+      initial_cog: 245.0
+      initial_hdg: 244
+      nav_status: 0
+
+    - mmsi: 525110892
+      name: "Samudera Nusantara"
+      ship_type: "Cargo Vessel"
+      imo: 9445890
+      call_sign: "YBTX"
+      draught: 7.8
+      destination: "TANJUNG PRIOK"
+      eta: "10-13 12:00"
+      gross_tonnage: 15400
+      deadweight: 22000
+      length: 172.0
+      beam: 27.0
+      year_built: 2012
+      flag: "Indonesia"
+      initial_lat: -5.8850
+      initial_lon: 106.1200
+      initial_sog: 11.2
+      initial_cog: 78.5
+      initial_hdg: 80
+      nav_status: 0
+
+aisstream:
+  url: "wss://stream.aisstream.io/v0/stream"
+  # Default bounding box or MMSI subscription filters
+  bounding_boxes:
+    - [[-10.0, 95.0], [6.0, 141.0]] # Indonesia archipelago
