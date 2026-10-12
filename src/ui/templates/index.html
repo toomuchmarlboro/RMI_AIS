@@ -41,7 +41,10 @@
     <div class="flex items-center space-x-4 mt-2 sm:mt-0">
       <div class="flex items-center bg-slate-800/80 border border-slate-700/60 rounded-lg px-3 py-1.5 text-xs">
         <span class="text-slate-400 mr-2">Feed Source:</span>
-        <span id="source-badge" class="font-semibold text-emerald-400 uppercase tracking-wide">SIMULATOR</span>
+        <span id="source-badge" class="font-semibold text-emerald-400 uppercase tracking-wide mr-2">SIMULATOR</span>
+        <button onclick="openSourceModal()" class="bg-blue-600 hover:bg-blue-500 text-white text-[11px] font-semibold px-2 py-0.5 rounded transition">
+          <i class="fa-solid fa-sliders text-[10px]"></i> Change
+        </button>
       </div>
 
       <div id="recording-status-box" class="flex items-center bg-slate-800/80 border border-slate-700/60 rounded-lg px-3 py-1.5 text-xs">
@@ -497,9 +500,119 @@
       }
     }
 
+    // Feed Source Switch Modal Logic
+    let modalSelectedMode = 'simulator';
+
+    function openSourceModal() {
+      document.getElementById('source-modal').classList.remove('hidden');
+      document.getElementById('source-modal').classList.add('flex');
+    }
+
+    function closeSourceModal() {
+      document.getElementById('source-modal').classList.add('hidden');
+      document.getElementById('source-modal').classList.remove('flex');
+      document.getElementById('modal-feedback').classList.add('hidden');
+    }
+
+    function setModalMode(mode) {
+      modalSelectedMode = mode;
+      const btnSim = document.getElementById('btn-mode-sim');
+      const btnAis = document.getElementById('btn-mode-ais');
+      const keyCont = document.getElementById('aisstream-key-container');
+
+      if (mode === 'aisstream') {
+        btnAis.className = 'py-2.5 px-3 rounded-lg border text-center font-medium border-blue-500 bg-blue-500/10 text-white';
+        btnSim.className = 'py-2.5 px-3 rounded-lg border text-center font-medium border-slate-700 bg-slate-950 text-slate-400';
+        keyCont.classList.remove('hidden');
+      } else {
+        btnSim.className = 'py-2.5 px-3 rounded-lg border text-center font-medium border-blue-500 bg-blue-500/10 text-white';
+        btnAis.className = 'py-2.5 px-3 rounded-lg border text-center font-medium border-slate-700 bg-slate-950 text-slate-400';
+        keyCont.classList.add('hidden');
+      }
+    }
+
+    async function applySourceSwitch() {
+      const fb = document.getElementById('modal-feedback');
+      fb.classList.add('hidden');
+
+      let key = '';
+      if (modalSelectedMode === 'aisstream') {
+        key = document.getElementById('input-aisstream-key').value.trim();
+        if (!key) {
+          fb.innerText = 'Please enter an aisstream.io API key.';
+          fb.classList.remove('hidden');
+          return;
+        }
+      }
+
+      try {
+        const res = await fetch('/api/source/switch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mode: modalSelectedMode, api_key: key })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          fb.innerText = data.detail || 'Failed to switch source.';
+          fb.classList.remove('hidden');
+          return;
+        }
+        closeSourceModal();
+        updateDashboardState();
+      } catch (err) {
+        fb.innerText = 'Connection error switching source: ' + err.message;
+        fb.classList.remove('hidden');
+      }
+    }
+
     // Refresh every 1.5 seconds
     setInterval(updateDashboardState, 1500);
     updateDashboardState();
   </script>
+
+  <!-- Feed Source Switch Modal -->
+  <div id="source-modal" class="fixed inset-0 bg-black/70 backdrop-blur-sm hidden items-center justify-center z-50 p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-xl max-w-md w-full p-6 shadow-2xl space-y-4">
+      <div class="flex items-center justify-between border-b border-slate-800 pb-3">
+        <h3 class="text-sm font-bold text-white flex items-center gap-2">
+          <i class="fa-solid fa-satellite-dish text-blue-400"></i> Configure AIS Feed Source
+        </h3>
+        <button onclick="closeSourceModal()" class="text-slate-400 hover:text-white text-lg">&times;</button>
+      </div>
+
+      <div class="space-y-3 text-xs">
+        <div>
+          <label class="block text-slate-300 font-semibold mb-1">Select Feed Mode:</label>
+          <div class="grid grid-cols-2 gap-2">
+            <button type="button" id="btn-mode-sim" onclick="setModalMode('simulator')"
+              class="py-2.5 px-3 rounded-lg border text-center font-medium border-blue-500 bg-blue-500/10 text-white">
+              Simulator (Offline)
+            </button>
+            <button type="button" id="btn-mode-ais" onclick="setModalMode('aisstream')"
+              class="py-2.5 px-3 rounded-lg border text-center font-medium border-slate-700 bg-slate-950 text-slate-400">
+              aisstream.io (Live)
+            </button>
+          </div>
+        </div>
+
+        <div id="aisstream-key-container" class="space-y-1.5 hidden">
+          <label class="block text-slate-300 font-semibold">aisstream.io API Key:</label>
+          <input type="password" id="input-aisstream-key" placeholder="Paste your free API key"
+            class="w-full bg-slate-950 border border-slate-700 px-3 py-2 rounded-lg text-slate-200 focus:outline-none focus:border-blue-500 font-mono text-xs">
+          <p class="text-[11px] text-slate-500">
+            Sign up for a free developer key at <a href="https://aisstream.io" target="_blank" class="text-blue-400 underline">aisstream.io</a>.
+          </p>
+        </div>
+
+        <div id="modal-feedback" class="text-xs text-rose-400 hidden"></div>
+      </div>
+
+      <div class="flex justify-end gap-2 pt-2 border-t border-slate-800">
+        <button onclick="closeSourceModal()" class="px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs">Cancel</button>
+        <button onclick="applySourceSwitch()" class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold">Apply & Connect</button>
+      </div>
+    </div>
+  </div>
 </body>
 </html>
+

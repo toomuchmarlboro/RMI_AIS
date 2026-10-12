@@ -80,6 +80,14 @@ class RecordingManager:
         self._ingest_task = None
         logger.info("Ingestion stopped.")
 
+    async def switch_source(self, new_source: DataSource) -> None:
+        """Dynamically switch to a different DataSource while keeping state."""
+        logger.info(f"Switching active data source from '{self.source.name}' to '{new_source.name}'...")
+        await self.stop_ingestion()
+        self.source = new_source
+        await self.start_ingestion()
+        logger.info(f"Data source successfully switched to '{new_source.name}'.")
+
     def start_recording(
         self,
         station_id: Optional[str] = None,

@@ -119,3 +119,73 @@ async def update_vessel_particulars(mmsi: int, particulars: VesselParticulars):
         manager._live_vessels[mmsi].particulars = particulars
 
     return {"status": "updated", "vessel": vessel.model_dump()}
+
+
+class SwitchSourceRequest(BaseModel):
+    mode: str  # 'simulator' or 'aisstream'
+    api_key: Optional[str] = None
+    bounding_boxes: Optional[List] = None
+
+
+def _update_env_file(key: str, value: str) -> None:
+    """Persist settings to .env file."""
+    env_path = Path(".env")
+    lines = []
+    found = False
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            if line.strip().startswith(f"{key}="):
+                lines.append(f"{key}={value}")
+                found = True
+            else:
+                lines.append(line)
+    if not found:
+        lines.append(f"{key}={value}")
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.environ[key] = value
+
+
+@app.post("/api/source/switch")
+async def switch_data_source(req: SwitchSourceRequest):
+    """Switch active data source between Simulator and aisstream.io."""
+    if not manager:
+        raise HTTPException(status_code=503, detail="Recording manager uninitialized")
+
+    mode = req.mode.lower()
+    if mode == "aisstream":
+        api_key = (req.api_key or os.getenv("AISSTREAM_API_KEY", "")).strip()
+        if not api_key:
+            raise HTTPException(status_code=400, detail="aisstream.io API key is required.")
+
+        from src.sources.aisstream import AisStreamSource
+        boxes = req.bounding_boxes or [[[-90.0, -180.0], [90.0, 180.0]]]
+        new_source = AisStreamSource(api_key=api_key, bounding_boxes=boxes)
+
+        _update_env_file("AIS_DATA_SOURCE", "aisstream")
+        _update_env_file("AISSTREAM_API_KEY", api_key)
+
+        await manager.switch_source(new_source)
+        return {"status": "switched", "source": "aisstream"}
+
+    elif mode == "simulator":
+        import yaml
+        from src.sources.simulator import SimulatorSource
+
+        cfg = {}
+        config_file = Path("config.yaml")
+        if config_file.exists():
+            with open(config_file, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+
+        vessels_cfg = cfg.get("simulator", {}).get("vessels", [])
+        interval = float(cfg.get("simulator", {}).get("update_interval_sec", 3.0))
+        new_source = SimulatorSource(vessels_config=vessels_cfg, interval_sec=interval)
+
+        _update_env_file("AIS_DATA_SOURCE", "simulator")
+
+        await manager.switch_source(new_source)
+        return {"status": "switched", "source": "simulator"}
+
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported mode: {req.mode}")
+
