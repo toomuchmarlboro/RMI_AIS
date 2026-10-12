@@ -28,6 +28,8 @@ wheels/
 *.sqlite
 *.sqlite3
 data/rmi_ais.db
+data/rmi_ais.db-shm
+data/rmi_ais.db-wal
 data/exports/
 !data/exports/.gitkeep
 
