@@ -91,6 +91,10 @@ class VesselStatic(BaseModel):
     dimension_to_port_m: Optional[float] = None
     dimension_to_starboard_m: Optional[float] = None
 
+    # Master data, when the source supplies it (e.g. the VesselFinder scraper).
+    # AIS itself never transmits tonnage, year built or flag.
+    particulars: Optional[VesselParticulars] = None
+
 
 class Vessel(BaseModel):
     """Consolidated vessel state matching VesselFinder interface."""
@@ -117,6 +121,10 @@ class Vessel(BaseModel):
 
     # Vessel particulars
     particulars: VesselParticulars = Field(default_factory=VesselParticulars)
+
+    # Provenance of the particulars above: 'vesselfinder', 'manual', 'simulator', ...
+    particulars_source: Optional[str] = None
+    particulars_updated_utc: Optional[datetime] = None
 
     def update_dynamic(self, dyn: VesselDynamic) -> None:
         """Update live telemetry from position report."""
@@ -145,6 +153,12 @@ class Vessel(BaseModel):
             self.destination = st.destination.strip()
         if st.eta:
             self.eta = st.eta.strip()
+
+        # Fold in any master data the source resolved, keeping existing values
+        # for fields it left blank.
+        if st.particulars:
+            for field_name, value in st.particulars.model_dump(exclude_none=True).items():
+                setattr(self.particulars, field_name, value)
 
         # Update dimensions if LOA / beam not already specified
         if st.dimension_to_bow_m is not None and st.dimension_to_stern_m is not None:

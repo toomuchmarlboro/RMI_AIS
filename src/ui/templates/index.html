@@ -76,6 +76,14 @@
         </button>
       </div>
 
+      <div id="enrichment-box" class="hidden items-center bg-slate-800/80 border border-slate-700/60 rounded-lg px-3 py-1.5 text-xs"
+           title="Vessel particulars enriched from VesselFinder">
+        <i class="fa-solid fa-circle-nodes text-amber-400 mr-2 text-[10px]"></i>
+        <span class="text-slate-400 mr-1">Enriched:</span>
+        <span id="enrichment-count" class="font-semibold text-amber-400">0</span>
+        <span id="enrichment-queued" class="text-slate-500 ml-1"></span>
+      </div>
+
       <div id="recording-status-box" class="flex items-center bg-slate-800/80 border border-slate-700/60 rounded-lg px-3 py-1.5 text-xs">
         <span id="recording-dot" class="w-2.5 h-2.5 rounded-full bg-slate-500 mr-2"></span>
         <span id="recording-label" class="font-semibold text-slate-300">IDLE</span>
@@ -508,7 +516,7 @@
       });
     }
 
-    function selectVessel(mmsi) {
+    function selectVessel(mmsi, pan = true) {
       selectedMmsi = mmsi;
       const v = trackedVessels.find(x => x.mmsi === mmsi);
       if (!v) return;
@@ -536,8 +544,9 @@
         document.getElementById('inspect-window').innerText = d.toTimeString().split(' ')[0] + " UTC";
       }
 
-      // Pan map smoothly to selected vessel
-      if (v.latitude && v.longitude) {
+      // Pan map smoothly to selected vessel (skipped on background refreshes
+      // so the poll does not fight the user's own panning)
+      if (pan && v.latitude && v.longitude) {
         map.panTo([v.latitude, v.longitude]);
       }
     }
@@ -629,6 +638,97 @@
       }).join('');
     }
 
+    // Feed-source badge styling per mode
+    const SOURCE_BADGES = {
+      simulator:    { label: 'SIMULATOR',    cls: 'text-emerald-400' },
+      aisstream:    { label: 'AISSTREAM.IO', cls: 'text-sky-400' },
+      vesselfinder: { label: 'VESSELFINDER', cls: 'text-amber-400' }
+    };
+
+    function renderSourceBadge(mode) {
+      const badge = document.getElementById('source-badge');
+      const info = SOURCE_BADGES[mode] || { label: (mode || 'UNKNOWN').toUpperCase(), cls: 'text-slate-300' };
+      badge.innerText = info.label;
+      badge.className = `font-semibold uppercase tracking-wide mr-2 ${info.cls}`;
+      // Keep the modal in sync with what is actually running
+      if (SOURCE_BADGES[mode]) modalSelectedMode = mode;
+    }
+
+    function renderEnrichment(enrichment) {
+      const box = document.getElementById('enrichment-box');
+      // Hidden unless the background enricher is actually running
+      if (!enrichment || !enrichment.enabled) {
+        box.classList.add('hidden');
+        box.classList.remove('flex');
+        return;
+      }
+      box.classList.remove('hidden');
+      box.classList.add('flex');
+
+      document.getElementById('enrichment-count').innerText = enrichment.enriched;
+      const queued = enrichment.queued || 0;
+      document.getElementById('enrichment-queued').innerText = queued ? `(${queued} queued)` : '';
+      box.title =
+        `Particulars from ${enrichment.source} - scope: ${enrichment.scope}, ` +
+        `${enrichment.lookups_last_hour}/${enrichment.max_per_hour} lookups this hour, ` +
+        `${enrichment.not_found} not found, ${enrichment.errors} errors`;
+    }
+
+    function renderRecordingStatus(state) {
+      const dot = document.getElementById('recording-dot');
+      const label = document.getElementById('recording-label');
+      const btnStart = document.getElementById('btn-start-record');
+      const btnStop = document.getElementById('btn-stop-record');
+      const session = state.active_session;
+
+      if (state.is_recording) {
+        dot.className = 'w-2.5 h-2.5 rounded-full bg-rose-500 mr-2 animate-pulse';
+        label.className = 'font-semibold text-rose-400';
+        label.innerText = 'RECORDING';
+        btnStart.disabled = true;
+        btnStart.className = 'bg-slate-800 text-slate-500 font-medium text-xs px-4 py-2 rounded-lg flex items-center gap-2 transition cursor-not-allowed';
+        btnStop.disabled = false;
+        btnStop.className = 'bg-rose-600 hover:bg-rose-500 text-white font-medium text-xs px-4 py-2 rounded-lg flex items-center gap-2 shadow transition';
+      } else {
+        dot.className = 'w-2.5 h-2.5 rounded-full bg-slate-500 mr-2';
+        label.className = 'font-semibold text-slate-300';
+        label.innerText = 'IDLE';
+        btnStart.disabled = false;
+        btnStart.className = 'bg-rose-600 hover:bg-rose-500 text-white font-medium text-xs px-4 py-2 rounded-lg flex items-center gap-2 shadow transition';
+        btnStop.disabled = true;
+        btnStop.className = 'bg-slate-800 text-slate-500 font-medium text-xs px-4 py-2 rounded-lg flex items-center gap-2 transition cursor-not-allowed';
+      }
+
+      document.getElementById('lbl-session-id').innerText = session ? session.session_id : 'None';
+      document.getElementById('lbl-station').innerText = session ? session.station_id : (document.getElementById('input-station').value.trim() || 'Station-Desktop-01');
+      document.getElementById('lbl-msg-count').innerText = session ? session.message_count : 0;
+    }
+
+    async function updateDashboardState() {
+      let state;
+      try {
+        const res = await fetch('/api/state');
+        if (!res.ok) return;
+        state = await res.json();
+      } catch (err) {
+        return;  // transient: the poll retries in 1.5s
+      }
+
+      trackedVessels = state.vessels || [];
+
+      renderSourceBadge(state.source_mode);
+      renderEnrichment(state.enrichment);
+      renderRecordingStatus(state);
+      renderMapMarkers(trackedVessels);
+      renderVessels(trackedVessels);
+      renderSessions(state.sessions || []);
+      renderStream(state.recent_records || []);
+
+      document.getElementById('fleet-count').innerText = trackedVessels.length;
+      // Keep the inspector panel live for the selected vessel
+      if (selectedMmsi != null) selectVessel(selectedMmsi, false);
+    }
+
     async function startRecording() {
       const station = document.getElementById('input-station').value.trim() || 'Station-Desktop-01';
       const res = await fetch('/api/record/start', {
@@ -662,21 +762,22 @@
       document.getElementById('modal-feedback').classList.add('hidden');
     }
 
+    const MODE_BTN_ACTIVE = 'py-2.5 px-3 rounded-lg border text-center font-medium border-blue-500 bg-blue-500/10 text-white';
+    const MODE_BTN_IDLE = 'py-2.5 px-3 rounded-lg border text-center font-medium border-slate-700 bg-slate-950 text-slate-400';
+
     function setModalMode(mode) {
       modalSelectedMode = mode;
-      const btnSim = document.getElementById('btn-mode-sim');
-      const btnAis = document.getElementById('btn-mode-ais');
-      const keyCont = document.getElementById('aisstream-key-container');
+      const buttons = {
+        simulator: document.getElementById('btn-mode-sim'),
+        aisstream: document.getElementById('btn-mode-ais'),
+        vesselfinder: document.getElementById('btn-mode-vf')
+      };
+      Object.keys(buttons).forEach(m => {
+        buttons[m].className = (m === mode) ? MODE_BTN_ACTIVE : MODE_BTN_IDLE;
+      });
 
-      if (mode === 'aisstream') {
-        btnAis.className = 'py-2.5 px-3 rounded-lg border text-center font-medium border-blue-500 bg-blue-500/10 text-white';
-        btnSim.className = 'py-2.5 px-3 rounded-lg border text-center font-medium border-slate-700 bg-slate-950 text-slate-400';
-        keyCont.classList.remove('hidden');
-      } else {
-        btnSim.className = 'py-2.5 px-3 rounded-lg border text-center font-medium border-blue-500 bg-blue-500/10 text-white';
-        btnAis.className = 'py-2.5 px-3 rounded-lg border text-center font-medium border-slate-700 bg-slate-950 text-slate-400';
-        keyCont.classList.add('hidden');
-      }
+      document.getElementById('aisstream-key-container').classList.toggle('hidden', mode !== 'aisstream');
+      document.getElementById('vesselfinder-container').classList.toggle('hidden', mode !== 'vesselfinder');
     }
 
     async function applySourceSwitch() {
@@ -684,6 +785,8 @@
       fb.classList.add('hidden');
 
       let key = '';
+      let targetMmsis = null;
+
       if (modalSelectedMode === 'aisstream') {
         key = document.getElementById('input-aisstream-key').value.trim();
         if (!key) {
@@ -693,11 +796,23 @@
         }
       }
 
+      if (modalSelectedMode === 'vesselfinder') {
+        const raw = document.getElementById('input-vf-mmsis').value.trim();
+        if (raw) {
+          targetMmsis = raw.split(/[\s,]+/).filter(Boolean).map(Number);
+          if (targetMmsis.some(isNaN)) {
+            fb.innerText = 'MMSI watchlist must contain only 9-digit numbers.';
+            fb.classList.remove('hidden');
+            return;
+          }
+        }
+      }
+
       try {
         const res = await fetch('/api/source/switch', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ mode: modalSelectedMode, api_key: key })
+          body: JSON.stringify({ mode: modalSelectedMode, api_key: key, target_mmsis: targetMmsis })
         });
         const data = await res.json();
         if (!res.ok) {
@@ -731,14 +846,18 @@
       <div class="space-y-3 text-xs">
         <div>
           <label class="block text-slate-300 font-semibold mb-1">Select Feed Mode:</label>
-          <div class="grid grid-cols-2 gap-2">
+          <div class="grid grid-cols-3 gap-2">
             <button type="button" id="btn-mode-sim" onclick="setModalMode('simulator')"
               class="py-2.5 px-3 rounded-lg border text-center font-medium border-blue-500 bg-blue-500/10 text-white">
-              Simulator (Offline)
+              Simulator<span class="block text-[10px] font-normal opacity-70">Offline</span>
             </button>
             <button type="button" id="btn-mode-ais" onclick="setModalMode('aisstream')"
               class="py-2.5 px-3 rounded-lg border text-center font-medium border-slate-700 bg-slate-950 text-slate-400">
-              aisstream.io (Live)
+              aisstream.io<span class="block text-[10px] font-normal opacity-70">Live positions</span>
+            </button>
+            <button type="button" id="btn-mode-vf" onclick="setModalMode('vesselfinder')"
+              class="py-2.5 px-3 rounded-lg border text-center font-medium border-slate-700 bg-slate-950 text-slate-400">
+              VesselFinder<span class="block text-[10px] font-normal opacity-70">Scraper</span>
             </button>
           </div>
         </div>
@@ -750,6 +869,25 @@
           <p class="text-[11px] text-slate-500">
             Sign up for a free developer key at <a href="https://aisstream.io" target="_blank" class="text-blue-400 underline">aisstream.io</a>.
           </p>
+        </div>
+
+        <div id="vesselfinder-container" class="space-y-1.5 hidden">
+          <label class="block text-slate-300 font-semibold">MMSI Watchlist:</label>
+          <input type="text" id="input-vf-mmsis" placeholder="636092932, 232003233"
+            class="w-full bg-slate-950 border border-slate-700 px-3 py-2 rounded-lg text-slate-200 focus:outline-none focus:border-blue-500 font-mono text-xs">
+          <p class="text-[11px] text-slate-500">
+            No API key needed. Leave blank to reuse the configured watchlist.
+          </p>
+          <div class="flex gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 p-2.5">
+            <i class="fa-solid fa-triangle-exclamation text-amber-400 mt-0.5"></i>
+            <p class="text-[11px] text-amber-200/90 leading-relaxed">
+              <span class="font-semibold">Approximate positions.</span>
+              VesselFinder's public pages round coordinates to whole degrees (&plusmn;0.5&deg;, ~55 km) and
+              publish no heading. Particulars, voyage data, SOG and COG are exact.
+              Records from this source are tagged <code class="font-mono">POS:APPROX</code>.
+              Use aisstream.io for precise tracks.
+            </p>
+          </div>
         </div>
 
         <div id="modal-feedback" class="text-xs text-rose-400 hidden"></div>

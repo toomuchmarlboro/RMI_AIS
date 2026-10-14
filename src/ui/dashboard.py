@@ -10,6 +10,8 @@ from pydantic import BaseModel
 
 from src.recorder.session import RecordingManager
 from src.models.vessel import VesselParticulars
+from src.sources.factory import SUPPORTED_MODES, build_source, load_yaml_config
+from src.sources.vesselfinder import POSITION_UNCERTAINTY_DEG
 
 app = FastAPI(title="RMI AIS Vessel Tracker", version="1.0.0")
 
@@ -51,6 +53,7 @@ async def get_dashboard_state():
 
     return {
         "source_mode": manager.source.name,
+        "enrichment": manager.enricher.stats if manager.enricher else None,
         "is_recording": manager.is_recording,
         "active_session": manager.active_session.model_dump() if manager.active_session else None,
         "vessels": [v.model_dump() for v in vessels],
@@ -114,17 +117,20 @@ async def update_vessel_particulars(mmsi: int, particulars: VesselParticulars):
         raise HTTPException(status_code=404, detail=f"Vessel with MMSI {mmsi} not found")
 
     vessel.particulars = particulars
+    vessel.particulars_source = "manual"
     manager.db.upsert_vessel(vessel)
-    if mmsi in manager._live_vessels:
-        manager._live_vessels[mmsi].particulars = particulars
+    # Manual entry wins: don't let the background enricher overwrite it.
+    manager.db.mark_enrichment(mmsi, "ok", source="manual")
+    manager._live_vessels[mmsi] = vessel
 
     return {"status": "updated", "vessel": vessel.model_dump()}
 
 
 class SwitchSourceRequest(BaseModel):
-    mode: str  # 'simulator' or 'aisstream'
+    mode: str  # 'simulator', 'aisstream' or 'vesselfinder'
     api_key: Optional[str] = None
     bounding_boxes: Optional[List] = None
+    target_mmsis: Optional[List[int]] = None
 
 
 def _update_env_file(key: str, value: str) -> None:
@@ -147,45 +153,76 @@ def _update_env_file(key: str, value: str) -> None:
 
 @app.post("/api/source/switch")
 async def switch_data_source(req: SwitchSourceRequest):
-    """Switch active data source between Simulator and aisstream.io."""
+    """Switch the live data source between Simulator, aisstream.io and VesselFinder."""
     if not manager:
         raise HTTPException(status_code=503, detail="Recording manager uninitialized")
 
-    mode = req.mode.lower()
-    if mode == "aisstream":
-        api_key = (req.api_key or os.getenv("AISSTREAM_API_KEY", "")).strip()
-        if not api_key:
-            raise HTTPException(status_code=400, detail="aisstream.io API key is required.")
-
-        from src.sources.aisstream import AisStreamSource
-        boxes = req.bounding_boxes or [[[-90.0, -180.0], [90.0, 180.0]]]
-        new_source = AisStreamSource(api_key=api_key, bounding_boxes=boxes)
-
-        _update_env_file("AIS_DATA_SOURCE", "aisstream")
-        _update_env_file("AISSTREAM_API_KEY", api_key)
-
-        await manager.switch_source(new_source)
-        return {"status": "switched", "source": "aisstream"}
-
-    elif mode == "simulator":
-        import yaml
-        from src.sources.simulator import SimulatorSource
-
-        cfg = {}
-        config_file = Path("config.yaml")
-        if config_file.exists():
-            with open(config_file, "r", encoding="utf-8") as f:
-                cfg = yaml.safe_load(f) or {}
-
-        vessels_cfg = cfg.get("simulator", {}).get("vessels", [])
-        interval = float(cfg.get("simulator", {}).get("update_interval_sec", 3.0))
-        new_source = SimulatorSource(vessels_config=vessels_cfg, interval_sec=interval)
-
-        _update_env_file("AIS_DATA_SOURCE", "simulator")
-
-        await manager.switch_source(new_source)
-        return {"status": "switched", "source": "simulator"}
-
-    else:
+    mode = req.mode.strip().lower()
+    if mode not in SUPPORTED_MODES:
         raise HTTPException(status_code=400, detail=f"Unsupported mode: {req.mode}")
+
+    cfg = load_yaml_config()
+    try:
+        new_source = build_source(
+            mode,
+            cfg,
+            api_key=req.api_key,
+            bounding_boxes=req.bounding_boxes,
+            target_mmsis=req.target_mmsis,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    _update_env_file("AIS_DATA_SOURCE", mode)
+    if mode == "aisstream" and req.api_key:
+        _update_env_file("AISSTREAM_API_KEY", req.api_key.strip())
+    if mode == "vesselfinder":
+        _update_env_file("VESSELFINDER_TARGET_MMSIS", ",".join(str(m) for m in new_source.target_mmsis))
+
+    await manager.switch_source(new_source)
+
+    result = {"status": "switched", "source": mode}
+    if mode == "vesselfinder":
+        result["target_mmsis"] = new_source.target_mmsis
+        result["position_precision"] = (
+            "VesselFinder's public pages round coordinates to whole degrees "
+            f"(+/-{POSITION_UNCERTAINTY_DEG} deg). Positions recorded from this source are "
+            "approximate and tagged POS:APPROX."
+        )
+    return result
+
+
+@app.post("/api/vessels/{mmsi}/enrich")
+async def enrich_vessel_from_vesselfinder(mmsi: int):
+    """Fill in a vessel's particulars from its public VesselFinder page, now.
+
+    Complements manual entry (Rule D08) and the background enricher. Bypasses
+    the scope filter and freshness check - an explicit request is always
+    honoured - but shares the enricher's HTTP client, cache and bookkeeping.
+    """
+    if not manager:
+        raise HTTPException(status_code=503, detail="Recording manager uninitialized")
+
+    enricher = manager.enricher
+    if enricher is None:
+        raise HTTPException(status_code=503, detail="Particulars enrichment is not configured")
+
+    vessel = await enricher.enrich(mmsi)
+    if vessel is None:
+        # Distinguish "VesselFinder doesn't know this ship" from "we couldn't reach it".
+        state = manager.db.get_enrichment_state(mmsi) or {}
+        if state.get("status") == "error":
+            raise HTTPException(
+                status_code=502,
+                detail=f"VesselFinder lookup for MMSI {mmsi} failed; see server log. Retry shortly.",
+            )
+        raise HTTPException(status_code=404, detail=f"VesselFinder has no particulars for MMSI {mmsi}")
+
+    manager._live_vessels[mmsi] = vessel
+    return {
+        "status": "enriched",
+        "source": enricher.SOURCE_NAME,
+        "particulars": vessel.particulars.model_dump(exclude_none=True),
+        "vessel": vessel.model_dump(),
+    }
 

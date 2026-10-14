@@ -79,3 +79,56 @@ aisstream:
   # Default bounding box or MMSI subscription filters
   bounding_boxes:
     - [[-10.0, 95.0], [6.0, 141.0]] # Indonesia archipelago
+
+enrichment:
+  # Hybrid architecture: aisstream.io supplies positions, VesselFinder supplies
+  # the master data AIS never transmits (GT, DWT, LOA, beam, year built, flag).
+  # Runs in the background, off the ingestion path, and is skipped entirely when
+  # VesselFinder is itself the active position source.
+  enabled: true
+
+  # Which vessels discovered by the position feed are eligible:
+  #   watchlist - only a session's explicit target_mmsis
+  #   recording - any vessel observed while recording (default)
+  #   all       - every vessel the feed reports
+  # A wide aisstream bounding box sees tens of thousands of vessels, most of
+  # them once; 'all' means tens of thousands of lookups, so prefer a narrow
+  # scope and let max_per_hour bound the rest.
+  scope: "recording"
+
+  # Hard ceiling on outbound lookups, sliding one-hour window (Rule A02).
+  # Keep this low: vesselfinder.com throttles persistent clients, and a
+  # sustained ~100/hour burst was enough to get connections refused outright.
+  max_per_hour: 60
+
+  # Re-check a successfully enriched vessel only this often (Rule A03:
+  # particulars are static data).
+  refresh_after_days: 30
+  # Back-off before retrying a vessel VesselFinder had no record of.
+  retry_after_days: 7
+
+  # Circuit breaker: after this many consecutive transport failures, stop
+  # calling VesselFinder for breaker_cooldown_sec. Position recording is
+  # never affected.
+  breaker_threshold: 5
+  breaker_cooldown_sec: 900
+
+vesselfinder:
+  # Watchlist poller over vesselfinder.com's public vessel pages (no API key).
+  # VesselFinder publishes no unauthenticated bounding-box query, so vessels
+  # must be named explicitly by MMSI.
+  #
+  # Position caveat: the public pages round lat/lon to whole degrees (~55 km).
+  # Static data (name, IMO, type, flag, GT/DWT, LOA/beam, year, draught,
+  # destination, ETA, SOG, COG) is exact. Keep aisstream as the position feed
+  # and use this source for particulars enrichment.
+  target_mmsis: []
+  poll_interval_sec: 120.0
+  # Minimum spacing between HTTP requests (Rule A02 - be a polite client).
+  # 5 s is deliberate: the site refused connections under faster sustained use.
+  min_request_interval_sec: 5.0
+  # Also fetch /vessels/details/<imo> for call sign, LOA/beam and coarse position.
+  enrich_details: true
+  # Emit the whole-degree position as observations (tagged POS:APPROX).
+  # Set false to record static/voyage data only.
+  include_approximate_position: true

@@ -20,7 +20,7 @@ class ObservationSession(BaseModel):
     station_id: str = "Station-Desktop-01"
     start_time_utc: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     end_time_utc: Optional[datetime] = None
-    recording_mode: str = "simulation"  # 'simulation', 'aisstream', 'marinetraffic', 'manual'
+    recording_mode: str = "simulation"  # 'simulation', 'aisstream', 'vesselfinder', 'manual'
     target_mmsis: List[int] = Field(default_factory=list, description="Target vessels to filter or empty for all")
     message_count: int = 0
     notes: Optional[str] = None

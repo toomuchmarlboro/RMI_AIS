@@ -9,7 +9,7 @@ fastapi>=0.110.0
 uvicorn>=0.28.0
 jinja2>=3.1.3
 
-# Networking & Live Feeds (aisstream.io / MarineTraffic)
+# Networking & Live Feeds (aisstream.io WebSocket / vesselfinder.com scraper)
 websockets>=12.0
 httpx>=0.27.0
 

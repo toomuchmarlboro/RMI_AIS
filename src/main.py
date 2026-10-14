@@ -3,17 +3,16 @@ from __future__ import annotations
 
 import os
 import sys
-import yaml
 import asyncio
 import logging
-from pathlib import Path
 from dotenv import load_dotenv
 import uvicorn
 
 from src.storage.database import DatabaseManager
+from src.sources.factory import build_source, load_yaml_config
 from src.sources.simulator import SimulatorSource
-from src.sources.aisstream import AisStreamSource
 from src.recorder.session import RecordingManager
+from src.recorder.enricher import ParticularsEnricher
 from src.ui.dashboard import app, set_recording_manager
 
 # Configure logging
@@ -28,11 +27,7 @@ logger = logging.getLogger("RMI_AIS")
 def load_config() -> dict:
     """Load configuration from config.yaml and environment."""
     load_dotenv()
-    config_file = Path("config.yaml")
-    if config_file.exists():
-        with open(config_file, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
-    return {}
+    return load_yaml_config()
 
 
 async def run_server() -> None:
@@ -43,25 +38,34 @@ async def run_server() -> None:
     export_dir = cfg.get("storage", {}).get("export_dir", "data/exports")
     default_station = os.getenv("DEFAULT_STATION_ID", cfg.get("app", {}).get("default_station", "Station-Desktop-01"))
 
-    # Select DataSource
-    source_mode = os.getenv("AIS_DATA_SOURCE", "simulator").lower()
-    aisstream_key = os.getenv("AISSTREAM_API_KEY", "")
-
+    # Select DataSource (Rule A01)
+    source_mode = os.getenv("AIS_DATA_SOURCE", "simulator").strip().lower()
     db = DatabaseManager(db_path=db_path)
 
-    if source_mode == "aisstream" and aisstream_key:
-        logger.info("Initializing AisStreamSource (Real-Time Global WebSocket)...")
-        boxes = cfg.get("aisstream", {}).get("bounding_boxes", [])
-        source = AisStreamSource(api_key=aisstream_key, bounding_boxes=boxes)
-    else:
-        logger.info("Initializing SimulatorSource (Realistic MarineTraffic/VesselFinder mock)...")
-        vessels_cfg = cfg.get("simulator", {}).get("vessels", [])
-        interval = float(cfg.get("simulator", {}).get("update_interval_sec", 3.0))
-        source = SimulatorSource(vessels_config=vessels_cfg, interval_sec=interval)
+    try:
+        source = build_source(source_mode, cfg)
+        logger.info(f"Initializing data source '{source.name}'...")
+    except ValueError as e:
+        logger.warning(f"{e} Falling back to the offline simulator.")
+        source = build_source("simulator", cfg)
 
+    if isinstance(source, SimulatorSource):
         # Pre-seed database with preset vessels
         for v in source.get_initial_vessels():
             db.upsert_vessel(v)
+
+    # Particulars enrichment: aisstream for positions, VesselFinder for master data
+    enrich_cfg = cfg.get("enrichment", {}) or {}
+    enricher = ParticularsEnricher(
+        db=db,
+        enabled=bool(enrich_cfg.get("enabled", True)),
+        scope=str(enrich_cfg.get("scope", "recording")),
+        max_per_hour=int(enrich_cfg.get("max_per_hour", 60)),
+        refresh_after_days=float(enrich_cfg.get("refresh_after_days", 30.0)),
+        retry_after_days=float(enrich_cfg.get("retry_after_days", 7.0)),
+        breaker_threshold=int(enrich_cfg.get("breaker_threshold", 5)),
+        breaker_cooldown_sec=float(enrich_cfg.get("breaker_cooldown_sec", 900.0)),
+    )
 
     # Initialize Recording Manager
     rm = RecordingManager(
@@ -69,10 +73,12 @@ async def run_server() -> None:
         source=source,
         default_station_id=default_station,
         export_dir=export_dir,
+        enricher=enricher,
     )
     set_recording_manager(rm)
 
     # Start live feed ingestion
+    await enricher.start()
     await rm.start_ingestion()
 
     # Launch Web Dashboard
@@ -88,6 +94,7 @@ async def run_server() -> None:
     finally:
         logger.info("Shutting down AIS Ingestion...")
         await rm.stop_ingestion()
+        await enricher.stop()
 
 
 def main():

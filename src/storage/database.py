@@ -12,6 +12,16 @@ from src.models.vessel import Vessel, VesselParticulars
 from src.models.observation import ObservationSession, ObservationRecord
 
 
+def _parse_utc(value: Optional[str]) -> Optional[datetime]:
+    """Parse a stored ISO-8601 timestamp, tolerating legacy/bad values."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        return None
+
+
 class DatabaseManager:
     """Manages SQLite storage with thread safety and WAL mode."""
 
@@ -127,6 +137,25 @@ class DatabaseManager:
                 CREATE INDEX IF NOT EXISTS idx_obs_received_at ON observation_records(received_at_utc);
                 """
             )
+        self._migrate_schema()
+
+    #: Columns added after the initial schema, applied in place on existing databases.
+    _ADDED_VESSEL_COLUMNS = (
+        ("particulars_source", "TEXT"),
+        ("particulars_updated_utc", "TEXT"),
+        ("enrichment_attempted_utc", "TEXT"),
+        ("enrichment_status", "TEXT"),
+    )
+
+    def _migrate_schema(self) -> None:
+        """Add columns introduced after the first release, without losing data."""
+        conn = self._get_connection()
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(vessels)")}
+
+        with self._lock, conn:
+            for column, col_type in self._ADDED_VESSEL_COLUMNS:
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE vessels ADD COLUMN {column} {col_type}")
 
     # -------------------------------------------------------------
     # Vessel Management
@@ -213,13 +242,79 @@ class DatabaseManager:
         cur = conn.execute("SELECT * FROM vessels ORDER BY last_seen_utc DESC")
         return [self._row_to_vessel(row) for row in cur.fetchall()]
 
+    # -------------------------------------------------------------
+    # Particulars Enrichment State
+    # -------------------------------------------------------------
+    def get_enrichment_state(self, mmsi: int) -> Optional[dict]:
+        """Return the enrichment bookkeeping for a vessel, or None if unknown."""
+        conn = self._get_connection()
+        cur = conn.execute(
+            """
+            SELECT particulars_source, particulars_updated_utc,
+                   enrichment_attempted_utc, enrichment_status
+            FROM vessels WHERE mmsi = ?
+            """,
+            (mmsi,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "source": row["particulars_source"],
+            "updated_utc": _parse_utc(row["particulars_updated_utc"]),
+            "attempted_utc": _parse_utc(row["enrichment_attempted_utc"]),
+            "status": row["enrichment_status"],
+        }
+
+    def mark_enrichment(
+        self,
+        mmsi: int,
+        status: str,
+        source: Optional[str] = None,
+        attempted_at: Optional[datetime] = None,
+    ) -> None:
+        """Record the outcome of an enrichment attempt.
+
+        ``status`` is ``'ok'``, ``'not_found'`` or ``'error'``. The success
+        timestamp is only advanced for ``'ok'`` so failures do not look like
+        fresh data, while ``enrichment_attempted_utc`` always advances to drive
+        retry back-off.
+        """
+        conn = self._get_connection()
+        stamp = (attempted_at or datetime.now(timezone.utc)).isoformat()
+
+        with self._lock, conn:
+            # Ensure a row exists so enrichment can precede the first position.
+            conn.execute("INSERT OR IGNORE INTO vessels (mmsi) VALUES (?)", (mmsi,))
+            if status == "ok":
+                conn.execute(
+                    """
+                    UPDATE vessels
+                    SET enrichment_status = ?, enrichment_attempted_utc = ?,
+                        particulars_source = coalesce(?, particulars_source),
+                        particulars_updated_utc = ?
+                    WHERE mmsi = ?
+                    """,
+                    (status, stamp, source, stamp, mmsi),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE vessels
+                    SET enrichment_status = ?, enrichment_attempted_utc = ?
+                    WHERE mmsi = ?
+                    """,
+                    (status, stamp, mmsi),
+                )
+
+    def count_enriched_vessels(self) -> int:
+        """Number of vessels carrying successfully scraped particulars."""
+        conn = self._get_connection()
+        cur = conn.execute("SELECT COUNT(*) AS n FROM vessels WHERE enrichment_status = 'ok'")
+        return cur.fetchone()["n"]
+
     def _row_to_vessel(self, row: sqlite3.Row) -> Vessel:
-        last_pos = None
-        if row["last_seen_utc"]:
-            try:
-                last_pos = datetime.fromisoformat(row["last_seen_utc"])
-            except ValueError:
-                pass
+        last_pos = _parse_utc(row["last_seen_utc"])
 
         part = VesselParticulars(
             gross_tonnage=row["gross_tonnage"],
@@ -248,6 +343,8 @@ class DatabaseManager:
             destination=row["destination"],
             eta=row["eta"],
             particulars=part,
+            particulars_source=row["particulars_source"],
+            particulars_updated_utc=_parse_utc(row["particulars_updated_utc"]),
         )
 
     # -------------------------------------------------------------

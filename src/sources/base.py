@@ -7,7 +7,7 @@ from src.models.vessel import VesselDynamic, VesselStatic
 
 
 class DataSource(abc.ABC):
-    """Common abstraction for AIS data ingestion (Simulator, Aisstream, MarineTraffic)."""
+    """Common abstraction for AIS data ingestion (Simulator, Aisstream, VesselFinder)."""
 
     def __init__(self, name: str):
         self.name = name

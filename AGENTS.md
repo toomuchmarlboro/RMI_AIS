@@ -17,7 +17,7 @@ Build a **recordable vessel tracking system** that captures, timestamps, and sto
 ### What This IS
 - A timestamped AIS data recorder for selected vessels
 - A system that can work **offline-first** with simulated/mock data
-- Later upgradeable to consume live MarineTraffic API or free AIS feeds
+- Later upgradeable to consume free live AIS feeds (aisstream.io) and public web data (vesselfinder.com)
 
 ---
 
@@ -75,7 +75,7 @@ Every vessel observation record must contain the following fields, matching Vess
 ## 3. NMEA / AIS Format Reference
 
 > [!IMPORTANT]
-> AIS data is transmitted over VHF radio as NMEA 0183 sentences. Understanding this is critical because the MarineTraffic API can deliver raw NMEA and all AIS data originates from this protocol.
+> AIS data is transmitted over VHF radio as NMEA 0183 sentences. Understanding this is critical because all AIS data originates from this protocol, and raw NMEA is what we archive for every observation.
 
 ### 3.1 NMEA 0183 Sentence Structure
 
@@ -165,24 +165,81 @@ Every vessel observation record must contain the following fields, matching Vess
 - Vessel selection/filtering (watch specific MMSIs or areas)
 - Auto-recording when a watched vessel appears
 
-### Phase 3: MarineTraffic API Integration (Paid)
+### Phase 3: VesselFinder Scraper Enrichment (Free)
+
+> MarineTraffic (Kpler) was dropped — no free tier, sales contact required.
+> Phase 3 instead scrapes vesselfinder.com's public vessel pages, which need
+> no key and carry the master data AIS never transmits.
 
 ```
-┌─────────────────────┐
-│ MarineTraffic API    │
-│                      │
-│ PS07: Single Vessel  │──REST──▶ Position data
-│ PS01: Historical     │──REST──▶ Track history
-│ PS06: Area Positions │──REST──▶ Area monitoring
-│ VD02: Particulars    │──REST──▶ Vessel details
-│ NMEA Stream (TCP)    │──TCP───▶ Raw AIS sentences
-└─────────────────────┘
+┌──────────────────────────────┐
+│ vesselfinder.com (public)    │
+│                              │
+│ /api/pub/click/<mmsi>  │─JSON─▶ name, IMO, type, flag, GT, DWT,
+│                        │        LOA, beam, year, draught, dest,
+│                        │        ETA, SOG, COG, nav status, fix time
+│ /vessels/details/<imo> │─HTML─▶ call sign, AIS type, LOA/beam,
+│                        │        coarse position (whole degrees)
+│ /api/pub/vi2/<mmsi>    │─JSON─▶ voyage / last port call
+└──────────────────────────────┘
 ```
 
 **Deliverables:**
-- MarineTraffic REST client (PS01, PS06, PS07, VD02)
-- API key management & credit tracking
-- Enriched data (GT, DWT, year built, photos)
+- `VesselFinderSource` watchlist poller + `VesselFinderScraper` HTTP client
+- Rate limiting, TTL caching, retry/backoff (A02, A03)
+- `ParticularsEnricher` background worker implementing the **hybrid
+  architecture** (below), plus `POST /api/vessels/{mmsi}/enrich` for
+  on-demand lookups
+
+### Phase 3a: Hybrid Architecture (the intended runtime shape)
+
+```
+┌──────────────┐  precise positions   ┌─────────────────┐
+│ aisstream.io │─────────────────────▶│ RecordingManager│──▶ SQLite
+└──────────────┘  SOG/COG/HDG/status  └────────┬────────┘
+                                               │ submit(mmsi)
+                                      ┌────────▼────────────┐
+                                      │ ParticularsEnricher │
+                                      │  scope + budget     │
+                                      └────────┬────────────┘
+                                               │ GT, DWT, LOA, beam,
+┌───────────────┐                              │ year built, flag
+│ vesselfinder  │◀─────────────────────────────┘
+└───────────────┘   (AIS never transmits these)
+```
+
+| Field group | Authoritative source |
+|---|---|
+| Position, SOG, COG, heading, nav status | **aisstream** (VesselFinder is whole-degree) |
+| Destination, ETA, draught, name, IMO, call sign | **aisstream** (AIS Types 5/24); VesselFinder fills gaps only |
+| GT, DWT, year built, flag | **VesselFinder** (absent from AIS entirely) |
+| LOA / beam | **VesselFinder** registered values override AIS antenna offsets |
+
+**Scope is mandatory, not optional.** A wide bounding box discovers tens of
+thousands of vessels (27,000+ in this project's Indonesia box, most seen once),
+so `enrichment.scope` defaults to `recording` and `max_per_hour` caps outbound
+lookups on a sliding window. Outcomes persist in
+`vessels.particulars_source` / `particulars_updated_utc` /
+`enrichment_status` / `enrichment_attempted_utc`, so each vessel is looked up
+once and coverage accumulates across runs.
+
+Enrichment is skipped entirely when VesselFinder is itself the position source.
+
+**Position precision limit (important):**
+VesselFinder publishes **no precise coordinates** to unauthenticated clients —
+its live map renders vessels into server-side PNG tiles, and the detail page
+rounds `ship_lat`/`ship_lon` to **whole degrees** (±0.5°, ~55 km). Heading is
+not published at all. Everything else is exact.
+
+Therefore: **aisstream.io remains the position feed**; VesselFinder is the
+particulars/voyage enrichment source. Observations recorded from VesselFinder
+are tagged `POS:APPROX` in `raw_nmea`, and coordinates can be suppressed with
+`vesselfinder.include_approximate_position: false`.
+
+**Scraping conduct:** only paths permitted by `robots.txt` are read
+(`/vessels/view/*`, `/aismap*`, `/worker1/*`, `/worker2/*` and the photo paths
+are disallowed and never touched). Requests are serialised with a minimum
+2 s spacing and a 30 s floor on the poll interval.
 
 ---
 
@@ -214,19 +271,20 @@ Every vessel observation record must contain the following fields, matching Vess
 | D05 | **Speed in knots, dimensions in meters, angles in degrees** | Match maritime conventions |
 | D06 | **Gross Tonnage unit is GT (not kg)** | GT is a volume measurement, not mass |
 | D07 | **Observation windows (start–end) are mandatory for recording sessions** | Core requirement from spec |
-| D08 | **Vessel particulars can be manually entered OR fetched from API** | Phase 1 has no API, so manual entry must work |
+| D08 | **Vessel particulars can be manually entered OR fetched from a source** | Phase 1 has no API, so manual entry must work; manual entry outranks the enricher |
+| D09 | **AIS is authoritative for anything AIS transmits** | Scraped voyage/dynamic data may be staler than the live feed; the enricher fills gaps only |
 
 ### 5.3 API Integration Rules
 
 | # | Rule | Rationale |
 |---|---|---|
-| A01 | **Abstract all data sources behind a common interface** | `DataSource` ABC → `SimulatorSource`, `AisStreamSource`, `MarineTrafficSource` |
-| A02 | **Rate-limit all API calls** | MarineTraffic charges per call; aisstream has fair-use limits |
-| A03 | **Cache vessel particulars aggressively** | Static data rarely changes; save API credits |
-| A04 | **Log every API call with timestamp, endpoint, and response status** | Debugging + cost tracking |
-| A05 | **Graceful degradation: if API is down, keep recording from cache** | Don't lose a session because of network hiccups |
-| A06 | **MarineTraffic API key format: 40-char hex string** | Validate before use |
-| A07 | **Support both JSON and XML response parsing from MarineTraffic** | Their API supports both |
+| A01 | **Abstract all data sources behind a common interface** | `DataSource` ABC → `SimulatorSource`, `AisStreamSource`, `VesselFinderSource`; built via `sources/factory.py` |
+| A02 | **Rate-limit all outbound calls** | aisstream has fair-use limits; scraping must stay polite (min 2 s spacing, 30 s poll floor) |
+| A03 | **Cache vessel particulars aggressively** | Static data rarely changes; detail pages cached 6 h, click payloads 60 s |
+| A04 | **Log every outbound call with timestamp, endpoint, and response status** | Debugging + conduct audit |
+| A05 | **Graceful degradation: if a source is down, keep recording from cache** | Don't lose a session because of network hiccups |
+| A06 | **Scrapers must honour `robots.txt` and send a real User-Agent** | Disallowed paths are never fetched |
+| A07 | **Never record scraped coordinates without a precision tag** | VesselFinder rounds to whole degrees; tagged `POS:APPROX` |
 
 ### 5.4 Code & File Structure Rules
 
@@ -270,11 +328,13 @@ RMI_AIS/
 │   │   ├── base.py              # Abstract DataSource interface
 │   │   ├── simulator.py         # Phase 1: Mock NMEA generator
 │   │   ├── aisstream.py         # Phase 2: aisstream.io WebSocket
-│   │   └── marinetraffic.py     # Phase 3: MarineTraffic REST API
+│   │   ├── vesselfinder.py      # Phase 3: vesselfinder.com scraper
+│   │   └── factory.py           # Mode → DataSource construction
 │   │
 │   ├── recorder/
 │   │   ├── __init__.py
 │   │   ├── session.py           # Recording session manager
+│   │   ├── enricher.py          # Background particulars enrichment
 │   │   └── exporter.py          # Export to CSV/JSON/Excel
 │   │
 │   ├── storage/
@@ -303,33 +363,76 @@ RMI_AIS/
 └── docs/
     ├── architecture.md          # Detailed architecture notes
     ├── nmea_reference.md        # NMEA/AIS format cheat sheet
-    └── marinetraffic_api.md     # MT API endpoint reference
+    └── vesselfinder_scraping.md # VF endpoint/field reference
 ```
 
 ---
 
-## 7. MarineTraffic API Reference (for Phase 3)
+## 7. VesselFinder Scraping Reference (for Phase 3)
 
-### 7.1 Key Endpoints
+### 7.1 Endpoints Used
 
-| Service | Code | Purpose | Auth | Returns |
-|---|---|---|---|---|
-| Single Vessel Position | **PS07** | Latest position of one vessel | API key (40-hex) | LAT, LON, SPEED, COURSE, STATUS, TIMESTAMP |
-| Vessel Historical Track | **PS01** | All positions over a time range | API key | Array of positions with timestamps |
-| Area Vessel Positions | **PS06** | All vessels in a bounding box | API key | Multiple vessel positions |
-| Vessel Particulars | **VD02** | Static vessel data | API key | Name, type, dimensions, tonnage, flag |
-| Raw NMEA Stream | TCP Push | Real-time NMEA sentences | Station contributor | `!AIVDM` sentences over TCP/UDP |
+| Endpoint | Auth | Format | Returns |
+|---|---|---|---|
+| `/api/pub/click/<mmsi>` | none | JSON | Identity, particulars, SOG, COG, draught, destination, ETA, nav status, last-fix time |
+| `/vessels/details/<imo>` | none | HTML | Call sign, AIS type, flag, LOA/beam, current draught, whole-degree position |
+| `/api/pub/vi2/<mmsi>` | none | JSON | Voyage / last port call (next port, ETA, ATD) |
 
-### 7.2 Authentication
-- **API Key:** 40-character hexadecimal string
-- **Passed as:** URL parameter `?api_key=XXXX` or header `X-API-Key`
-- **Response formats:** `json`, `jsono`, `xml`, `csv`
-- **Credit system:** Each API call costs credits; monitor usage
+MMSI → IMO is resolved from the click payload's `imo` field. Vessels **without**
+an IMO (small craft, many ferries and tugs) are served at the same path by
+MMSI, so the scraper falls back to `/vessels/details/<mmsi>` — important for
+this project's Indonesian ferry fleet, much of which has no IMO number.
 
-### 7.3 Demo / Trial Access
-- **No free public API tier** — MarineTraffic (now Kpler) requires contacting sales
-- **Option:** Request a demo through [Kpler/MarineTraffic portal](https://www.marinetraffic.com)
-- **Alternative for development:** Use **aisstream.io** (free WebSocket API with real AIS data)
+The position/SOG/COG bootstrap lives in a `<div id="djson" data-json='…'>`
+element on the detail page.
+
+### 7.2 Click Payload Field Map
+
+| Key | Meaning | Notes |
+|---|---|---|
+| `name` | Vessel name | Echoes the MMSI string when unknown |
+| `imo` / `y` / `gt` / `dw` | IMO, year built, gross tonnage, deadweight | `0` means unknown |
+| `type` | Ship type text | `"unknown type"` means unknown |
+| `country` / `a2` | Flag state / ISO-2 code | |
+| `al` / `aw` | Length overall / beam (m) | `0` means unknown |
+| `ss` / `cu` | SOG (kn) / COG (deg) | `-1` means unknown |
+| `draught` | Current draught × 10 | `128` → 12.8 m |
+| `drm` | Max draught (string, m) | |
+| `dest` / `etaTS` | Destination / ETA (unix) | ETA rendered as `MM-DD HH:MM` |
+| `.ns` | Navigation status code | `-1` means unknown → status 15 |
+| `ts` | Last position report (unix UTC) | Used for de-duplicating observations |
+
+### 7.3 Limits & Conduct
+- **No precise position.** Map vessels are rendered into server-side PNG tiles;
+  the detail page rounds `ship_lat`/`ship_lon` to whole degrees (±0.5°, ~55 km).
+  **No heading** is published. Use aisstream.io for real tracks.
+
+  > **This is a deliberate upstream change, not a parsing bug.**
+  > [`derhuerst/scrape-vesselfinder`](https://github.com/derhuerst/scrape-vesselfinder)
+  > reads the same `#djson` element and documents full precision
+  > (`ship_lat: 52.4449, ship_lon: 13.15839`) for MMSI 211627650. Re-checking
+  > that exact vessel on 2026-10-14 returns `ship_lat: 52, ship_lon: 13`.
+  > VesselFinder has since reduced public coordinate precision site-wide —
+  > verified across IMO and non-IMO vessels, satellite and terrestrial
+  > coverage, and fixes as fresh as "0 min ago". Don't re-attempt this.
+
+- `/api/pub/weather/at/<mmsi>` returns live wind/wave/temp **at** the vessel
+  (`wsp`, `wdir`, `temp`, `htsgw`) but discloses no coordinates — the server
+  knows the precise position and will not return it.
+
+- **The site throttles persistent clients, silently.** A sustained ~100
+  lookups/hour at 2 s spacing caused vesselfinder.com to stop accepting TCP
+  connections from the dev machine altogether (no 403 — just hangs/refusals,
+  while every other host stayed reachable). Hence: 5 s minimum spacing,
+  `max_per_hour: 60`, and a circuit breaker that pauses enrichment for 15 min
+  after 5 consecutive transport failures. Treat timeouts as back-pressure, not
+  as "vessel not found" — the two are reported separately
+  (`enrichment_status` of `error` vs `not_found`; HTTP 502 vs 404).
+- **No bounding-box query**, so the source is a watchlist poller keyed by MMSI.
+- **No historical track** endpoint is publicly reachable (`/api/pub/dm3/` returns
+  `{"success": false}` unauthenticated).
+- **Conduct:** honour `robots.txt`, real User-Agent, min 2 s between requests,
+  30 s floor on poll interval, detail pages cached 6 h.
 
 ---
 
@@ -338,7 +441,8 @@ RMI_AIS/
 | Source | Type | Cost | Data Quality | Best For |
 |---|---|---|---|---|
 | **Built-in Simulator** | Mock NMEA | Free | Synthetic | Phase 1 development & testing |
-| **aisstream.io** | WebSocket | Free (API key) | Real global AIS | Phase 2 live testing |
+| **aisstream.io** | WebSocket | Free (API key) | Real global AIS | Phase 2 live testing; **the position feed** |
+| **vesselfinder.com** | Web scrape | Free (no key) | Exact particulars, coarse position | Phase 3 particulars/voyage enrichment |
 | **AISHub** | REST/TCP | Free (give-to-get) | Real aggregated AIS | Alternative to aisstream |
 | **RTL-SDR + AIS-catcher** | Hardware | ~$30 dongle | Local live AIS | Ultimate DIY option |
 
@@ -353,7 +457,7 @@ RMI_AIS/
 | AIS Decoding | `pyais` library | Battle-tested AIVDM decoder |
 | Database | SQLite (via `sqlite3` or `SQLAlchemy`) | Zero-config, portable |
 | WebSocket Client | `websockets` | For aisstream.io (Phase 2) |
-| HTTP Client | `httpx` | Async-capable, for MarineTraffic API |
+| HTTP Client | `httpx` | Async-capable, for the VesselFinder scraper |
 | CLI | `click` or `typer` | Nice CLI UX |
 | Config | `python-dotenv` + `pyyaml` | `.env` for secrets, YAML for settings |
 | Testing | `pytest` | Standard |
@@ -407,7 +511,7 @@ RMI_AIS/
 4. **Data Source Progression:** 
    - **Phase 1:** Built-in realistic NMEA Simulator for robust offline development and testing.
    - **Phase 2 (Immediate next step):** `aisstream.io` real-time WebSocket connection using free API key.
-   - **Phase 3:** Seamless toggle to MarineTraffic REST / NMEA stream when paid API access is acquired.
+   - **Phase 3:** `vesselfinder.com` public-page scraper for vessel particulars and voyage data (MarineTraffic dropped — no free tier). Positions stay on aisstream.io; VesselFinder's public coordinates are whole-degree only.
 5. **Deployment Target:** **Windows Desktop environment**.
 6. **Vessel Particulars & Gross Tonnage:** Gross Tonnage stored as `GT` (volume measure), with optional Deadweight (`DWT` in tonnes) and physical dimensions (Length `LOA`, Beam/Width in meters).
 

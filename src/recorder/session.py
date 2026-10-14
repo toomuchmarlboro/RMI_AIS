@@ -12,6 +12,7 @@ from src.models.observation import ObservationSession, ObservationRecord
 from src.storage.database import DatabaseManager
 from src.sources.base import DataSource
 from src.recorder.exporter import SessionExporter
+from src.recorder.enricher import ParticularsEnricher, build_gap_filling_static
 
 logger = logging.getLogger(__name__)
 
@@ -25,12 +26,16 @@ class RecordingManager:
         source: DataSource,
         default_station_id: str = "Station-Desktop-01",
         export_dir: str = "data/exports",
+        enricher: Optional[ParticularsEnricher] = None,
     ):
         self.db = db
         self.source = source
         self.default_station_id = default_station_id
         self.export_dir = Path(export_dir)
         self.export_dir.mkdir(parents=True, exist_ok=True)
+        self.enricher = enricher
+        if enricher is not None:
+            enricher.on_enriched = self._apply_enrichment
 
         self._active_session: Optional[ObservationSession] = None
         self._live_vessels: Dict[int, Vessel] = {}
@@ -49,6 +54,22 @@ class RecordingManager:
     @property
     def is_recording(self) -> bool:
         return self._active_session is not None and self._active_session.is_active
+
+    def _apply_enrichment(self, mmsi: int, snapshot) -> None:
+        """Merge a scraped snapshot into the live vessel, keeping its position.
+
+        The enricher works from a database copy, which lags the in-memory
+        vessel's latest fix, so results are applied here rather than by
+        replacing the live object.
+        """
+        live = self._live_vessels.get(mmsi)
+        if live is None:
+            # Not tracked yet; the DB already has it and the next sighting loads it.
+            return
+
+        live.update_static(build_gap_filling_static(live, snapshot))
+        live.particulars_source = ParticularsEnricher.SOURCE_NAME
+        live.particulars_updated_utc = datetime.now(timezone.utc)
 
     def get_live_vessels(self) -> List[Vessel]:
         """Return list of all actively tracked vessels."""
@@ -108,6 +129,12 @@ class RecordingManager:
         )
         self.db.create_session(session)
         self._active_session = session
+
+        # Look up watched vessels up front rather than waiting for a sighting.
+        if self.enricher and self.source.name != self.enricher.SOURCE_NAME:
+            for target in session.target_mmsis:
+                self.enricher.submit(target, is_recording=True, is_target=True)
+
         logger.info(f"Started recording session: {session.session_id} (Station: {session.station_id})")
         return session
 
@@ -152,6 +179,16 @@ class RecordingManager:
 
                 # Persist vessel state
                 self.db.upsert_vessel(vessel)
+
+                # Offer the vessel for particulars enrichment. Redundant when
+                # the position feed is itself the enrichment source.
+                if self.enricher and self.source.name != self.enricher.SOURCE_NAME:
+                    targets = self._active_session.target_mmsis if self._active_session else []
+                    self.enricher.submit(
+                        mmsi,
+                        is_recording=self.is_recording,
+                        is_target=mmsi in targets,
+                    )
 
                 # Record observation if session is active
                 if self.is_recording and self._active_session:
